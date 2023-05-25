@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/slack-go/slack"
+	"github.com/sony/gobreaker"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -21,10 +21,174 @@ const (
 	ExpectedMimeType = "application/json"
 	SlackToken       = ""
 	SlackChannel     = "#channel-name"
+	RetryMaxAttempts = 3
 )
 
+type PollingService interface {
+	Poll() ([]byte, error)
+}
+
+type WebhookService interface {
+	Send(body []byte, mimeType string) error
+}
+
+type SlackService interface {
+	SendMessage(message string)
+}
+
+type pollAndForwardHandler struct {
+	pollingService PollingService
+	webhookService WebhookService
+	slackService   SlackService
+	policyFunc     func([]byte) bool
+	logger         *zap.SugaredLogger
+	circuitBreaker *gobreaker.CircuitBreaker
+}
+
+func (h *pollAndForwardHandler) Run(ctx context.Context) {
+	ticker := time.NewTicker(PollingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			h.logger.Debugw("Polling cancelled",
+				"module", "polling",
+			)
+			return
+		case <-ticker.C:
+			h.execute()
+		}
+	}
+}
+
+func (h *pollAndForwardHandler) execute() {
+	_, err := h.circuitBreaker.Execute(func() (interface{}, error) {
+		data, err := h.pollingService.Poll()
+		if err != nil {
+			h.logger.Errorw("Error in poll and forward",
+				"module", "main",
+				"error", err,
+			)
+			h.slackService.SendMessage(fmt.Sprintf("Error in poll and forward: %v\n", err))
+			return nil, err
+		}
+
+		if h.policyFunc(data) {
+			err := h.webhookService.Send(data, ExpectedMimeType)
+			if err != nil {
+				h.logger.Errorw("Error sending to webhook",
+					"module", "main",
+					"error", err,
+				)
+				h.slackService.SendMessage(fmt.Sprintf("Error sending to webhook: %v", err))
+				return nil, err
+			}
+		}
+
+		return nil, nil
+	})
+
+	if err != nil {
+		h.logger.Errorw("Circuit breaker tripped",
+			"module", "main",
+			"error", err,
+		)
+		h.slackService.SendMessage("Circuit breaker tripped. Service temporarily unavailable.")
+	}
+}
+
+type HttpPollingService struct {
+	logger *zap.SugaredLogger
+}
+
+func (s *HttpPollingService) Poll() ([]byte, error) {
+	resp, err := http.Get(PollingURL)
+	if err != nil {
+		s.logger.Errorw("Error polling",
+			"URL", PollingURL,
+			"error", err,
+		)
+		return nil, fmt.Errorf("error polling %s: %v", PollingURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		s.logger.Warnw("Non-OK HTTP status",
+			"URL", PollingURL,
+			"statusCode", resp.StatusCode,
+			"responseBody", string(body),
+		)
+		return nil, fmt.Errorf("non-OK HTTP status from %s: %d", PollingURL, resp.StatusCode)
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		s.logger.Errorw("Error reading response body",
+			"error", err,
+		)
+		return nil, fmt.Errorf("error reading response body: %v", err)
+	}
+
+	return body, nil
+}
+
+type HttpWebhookService struct {
+	logger *zap.SugaredLogger
+}
+
+func (s *HttpWebhookService) Send(body []byte, mimeType string) error {
+	resp, err := http.Post(WebhookURL, mimeType, bytes.NewReader(body))
+	if err != nil {
+		s.logger.Errorw("Error sending to webhook",
+			"URL", WebhookURL,
+			"error", err,
+		)
+		return fmt.Errorf("error sending to webhook %s: %v", WebhookURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		s.logger.Warnw("Non-OK HTTP status from webhook",
+			"URL", WebhookURL,
+			"statusCode", resp.StatusCode,
+			"responseBody", string(body),
+		)
+		return fmt.Errorf("non-OK HTTP status from webhook %s: %d\n%s", WebhookURL, resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+type SlackNotificationService struct {
+	slackClient *slack.Client
+	logger      *zap.SugaredLogger
+}
+
+func (s *SlackNotificationService) SendMessage(message string) {
+	if SlackToken != "" {
+		_, _, err := s.slackClient.PostMessage(
+			SlackChannel,
+			slack.MsgOptionText(message, false),
+		)
+		if err != nil {
+			s.logger.Errorw("Error sending Slack message",
+				"error", err,
+			)
+		}
+	}
+}
+
+func shouldForward(data []byte) bool {
+	// Add your policy logic here
+	// For example, you can check specific conditions in the data
+	// and return true if it meets the forwarding criteria, or false otherwise
+	return true
+}
+
 func main() {
-	// Initialize logger with debug level, console and file outputs
 	logger, _ := zap.Config{
 		Level:       zap.NewAtomicLevelAt(zap.DebugLevel),
 		Development: true,
@@ -45,90 +209,48 @@ func main() {
 		OutputPaths:      []string{"stdout", "polldancer.log"},
 		ErrorOutputPaths: []string{"stderr"},
 	}.Build()
-	defer logger.Sync() // flushes buffer, if any
+	defer logger.Sync()
 	sugar := logger.Sugar()
 
-	// Initialize Slack client
 	slackClient := slack.New(SlackToken)
 
-	// Create a ticker for polling interval
-	ticker := time.NewTicker(PollingInterval)
-	defer ticker.Stop()
+	pollingService := &HttpPollingService{
+		logger: sugar,
+	}
+	webhookService := &HttpWebhookService{
+		logger: sugar,
+	}
+	slackService := &SlackNotificationService{
+		slackClient: slackClient,
+		logger:      sugar,
+	}
+
+	breaker := gobreaker.NewCircuitBreaker(gobreaker.Settings{
+		Name:        "polling",
+		MaxRequests: RetryMaxAttempts,
+		Timeout:     5 * time.Second,
+		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
+			sugar.Infow("Circuit breaker state changed",
+				"name", name,
+				"from", from,
+				"to", to,
+			)
+		},
+	})
+
+	handler := &pollAndForwardHandler{
+		pollingService: pollingService,
+		webhookService: webhookService,
+		slackService:   slackService,
+		policyFunc:     shouldForward,
+		logger:         sugar,
+		circuitBreaker: breaker,
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				sugar.Debugw("Polling cancelled",
-					// Structured context as loosely typed key-value pairs.
-					"module", "polling",
-				)
-				return
-			case <-ticker.C:
-				err := pollAndForward(sugar, slackClient)
-				if err != nil {
-					sugar.Errorw("Error in poll and forward",
-						"module", "main",
-						"error", err,
-					)
-					sendSlackError(slackClient, fmt.Sprintf("Error in poll and forward: %v\n", err))
-				}
-			}
-		}
-	}()
+	go handler.Run(ctx)
 
-	// Block main goroutine until it's cancelled
 	<-ctx.Done()
-}
-
-func pollAndForward(sugar *zap.SugaredLogger, slackClient *slack.Client) error {
-	resp, err := http.Get(PollingURL)
-	if err != nil {
-		return fmt.Errorf("error polling %s: %v", PollingURL, err)
-	}
-	defer resp.Body.Close()
-
-	mimeType := resp.Header.Get("Content-Type")
-	if !strings.HasPrefix(mimeType, ExpectedMimeType) {
-		return fmt.Errorf("unexpected Content-Type, expected %s but got %s", ExpectedMimeType, mimeType)
-	}
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("error reading response body: %v", err)
-	}
-
-	err = sendToWebhook(sugar, mimeType, body)
-	if err != nil {
-		return fmt.Errorf("error sending to webhook: %v", err)
-	}
-
-	return nil
-}
-
-func sendToWebhook(sugar *zap.SugaredLogger, mimeType string, body []byte) error {
-	webhookResp, err := http.Post(WebhookURL, mimeType, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("error sending to webhook %s: %v", WebhookURL, err)
-	}
-	defer webhookResp.Body.Close()
-
-	if webhookResp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(webhookResp.Body)
-		return fmt.Errorf("non-OK HTTP status from webhook %s: %d\n%s", WebhookURL, webhookResp.StatusCode, string(body))
-	}
-
-	return nil
-}
-
-func sendSlackError(slackClient *slack.Client, message string) {
-	if SlackToken != "" {
-		slackClient.PostMessage(
-			SlackChannel,
-			slack.MsgOptionText(message, false),
-		)
-	}
 }

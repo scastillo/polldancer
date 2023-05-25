@@ -4,6 +4,7 @@ go 1.17
 
 require (
 	github.com/slack-go/slack v0.12.2
+	github.com/sony/gobreaker v0.5.0
 	go.uber.org/zap v1.24.0
 )
 
