@@ -1,6 +1,4 @@
-.PHONY: all polldancer test clean help daemon run tidy run-webhook-server
-
-.SILENT:
+.PHONY: all polldancer test clean help daemon run tidy run-webhook-server stop-webhook-server build-docker-image run-docker-container
 
 all: help
 
@@ -32,6 +30,8 @@ help:
 	@echo "make tidy - tidy and verify module dependencies"
 	@echo "make run-webhook-server - run webhook server"
 	@echo "make stop-webhook-server - stop webhook server"
+	@echo "make build-docker-image - build Docker image"
+	@echo "make run-docker-container - run Docker container"
 
 daemon: polldancer
 	@echo "Running polldancer as a daemon..."
@@ -51,3 +51,11 @@ run-webhook-server:
 stop-webhook-server:
 	@echo "Stopping webhook server..."
 	@-kill `cat server.pid` 2>/dev/null || true && rm -f server.pid
+
+build-docker-image:
+	@echo "Building Docker image..."
+	docker build -t polldancer:latest .
+
+run-docker-container:
+	@echo "Running Docker container..."
+	docker run -d --name polldancer-container polldancer:latest
