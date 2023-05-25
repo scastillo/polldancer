@@ -14,6 +14,35 @@ Polldancer is a Go application that polls a remote service at regular intervals 
 - Go 1.16 or later
 - Python 3.x (for running the webhook server)
 
+### Configuration 
+Polldancer can be configured using the following environment variables:
+
+- `SLACK_TOKEN`: Slack API token for sending notifications to a Slack channel.
+- `SLACK_CHANNEL`: Slack channel name to which notifications will be sent.
+- `WEBHOOK_URL`: Webhook URL to forward the data to.
+- `POLLING_URL`: URL to poll data from.
+- `EXPECTED_MIME_TYPE`: Expected MIME type of the data from the polling URL.
+- `POLLING_INTERVAL`: Interval between each poll in the format "5s" (default: 5 seconds).
+- `RETRY_MAX_ATTEMPTS`: Maximum number of retry attempts before the circuit breaker trips (default: 3).
+
+## Architecture
+
+Polldancer follows the Onion architecture with Domain-Driven Design (DDD) principles to promote modularity, testability, and maintainability. The code is organized into different layers:
+
+- `cmd`: Contains the main entry point of the application.
+- `internal`: Contains the core logic of the application, including the polling, webhook, and Slack services.
+- `pkg`: Contains reusable packages and interfaces.
+- `mocks`: Contains the mock implementations of the interfaces for unit testing.
+- `scripts`: Contains the helper scripts for building and running the application.
+- `vendor`: Contains the application dependencies.
+
+The recent improvements include the following updates:
+
+- Added a circuit breaker implementation using the `gobreaker` library to prevent continuous retries during failures. The circuit breaker is applied to the polling and forwarding process.
+- The circuit breaker allows a maximum number of retry attempts before temporarily stopping the execution.
+- Logging is implemented using the Zap logger library for structured and configurable logging output.
+- Each service is now initialized with a logger instance for consistent logging across the application.
+
 ### Installation
 
 1. Clone the repository:
@@ -28,6 +57,20 @@ Polldancer is a Go application that polls a remote service at regular intervals 
    ```bash
    make polldancer
    ```
+
+### Docker
+
+Polldancer can also be run as a Docker container. To build and run the Docker image, use the following commands:
+
+```bash
+# Build the Docker image
+make build-image
+
+# Run the Docker container
+make run-container
+```
+
+The Docker image is built with the necessary environment variables configured through the `.env` file.
 
 ### Usage
 
